@@ -1,0 +1,5 @@
+mist-radius.ini
+logs/
+__pycache__/
+*.pyc
+~$*.docx

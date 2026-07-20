@@ -12,7 +12,13 @@ Supported Mist event types → RADIUS Acct-Status-Type mapping:
   NAC_ACCOUNTING_STOP   → 2  (Stop)
 
 Usage:
-  python3 mist_nac_radius.py
+  python3 mist_nac_radius.py [-c /path/to/mist-radius.ini]
+
+Configuration:
+  All settings live in mist-radius.ini (see mist-radius.ini.example).
+  By default the script looks for mist-radius.ini in its own directory,
+  or at the path given by the MIST_RADIUS_CONFIG environment variable,
+  or via the -c/--config command-line flag.
 
 Requirements:
   Python 3.8+ — no third-party packages needed.
@@ -20,11 +26,13 @@ Requirements:
 FortiGate RSSO configuration:
   User & Authentication → RADIUS SSO → Create New
     - Primary RADIUS server: this host's IP
-    - Shared secret: must match RADIUS_SECRET below
+    - Shared secret: must match radius_secret in mist-radius.ini
     - Accounting port: 1813
     - RSSO attribute: User-Name
 """
 
+import argparse
+import configparser
 import hashlib
 import json
 import logging
@@ -33,26 +41,57 @@ import os
 import random
 import socket
 import struct
+import sys
+import threading
+import time
 from datetime import date, datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-LISTEN_HOST  = "0.0.0.0"       # Bind to all interfaces
-LISTEN_PORT  = 8080             # Port forwarded through your firewall to this host
+def _resolve_config_path() -> str:
+    """Determine which config file to load: -c flag > env var > script directory."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("-c", "--config")
+    args, _ = parser.parse_known_args()
 
-RADIUS_HOST   = "172.16.0.12"  # FortiGate IP address
-RADIUS_PORT   = 1813            # RADIUS Accounting port (RFC 2866 default)
-RADIUS_SECRET = "changeme"     # Shared secret — must match FortiGate RSSO config
+    if args.config:
+        return args.config
+    if os.environ.get("MIST_RADIUS_CONFIG"):
+        return os.environ["MIST_RADIUS_CONFIG"]
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "mist-radius.ini")
+
+
+def load_config(path: str) -> configparser.ConfigParser:
+    if not os.path.isfile(path):
+        sys.exit(
+            f"Config file not found: {path}\n"
+            "Copy mist-radius.ini.example to mist-radius.ini and edit it."
+        )
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    return parser
+
+
+CONFIG_PATH = _resolve_config_path()
+_cfg = load_config(CONFIG_PATH)
+
+LISTEN_HOST = _cfg.get("server", "listen_host", fallback="0.0.0.0")
+LISTEN_PORT = _cfg.getint("server", "listen_port", fallback=8080)
+
+RADIUS_HOST   = _cfg.get("radius", "radius_host")
+RADIUS_PORT   = _cfg.getint("radius", "radius_port", fallback=1813)
+RADIUS_SECRET = _cfg.get("radius", "radius_secret")
+RADIUS_SECRET_BYTES = RADIUS_SECRET.encode()
 
 # Directory where daily log files are written.
 # Files are named: nac_accounting_YYYY-MM-DD.log
-LOG_DIR = "./logs"
+LOG_DIR = _cfg.get("logging", "log_dir", fallback="./logs")
 
-# Optional Mist webhook secret (sent as X-Mist-Secret header). None = disabled.
-WEBHOOK_SECRET = None
+# Optional Mist webhook secret (sent as X-Mist-Secret header). Empty/absent = disabled.
+WEBHOOK_SECRET = _cfg.get("server", "webhook_secret", fallback="") or None
 
 # ---------------------------------------------------------------------------
 # RADIUS attribute type constants  (RFC 2865 / 2866)
@@ -120,15 +159,16 @@ class DailyFileHandler(logging.FileHandler):
     The file is created if it doesn't exist, or appended to if it does.
     """
 
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, prefix: str):
         self._log_dir     = log_dir
+        self._prefix      = prefix
         self._current_day = None
         os.makedirs(log_dir, exist_ok=True)
         super().__init__(self._day_path(), mode="a", encoding="utf-8", delay=False)
 
     def _day_path(self) -> str:
         self._current_day = date.today().isoformat()
-        return os.path.join(self._log_dir, f"nac_accounting_{self._current_day}.log")
+        return os.path.join(self._log_dir, f"{self._prefix}_{self._current_day}.log")
 
     def emit(self, record: logging.LogRecord) -> None:
         # Roll over to a new file if the calendar date has changed
@@ -140,7 +180,13 @@ class DailyFileHandler(logging.FileHandler):
 
 
 def setup_logging(log_dir: str) -> None:
-    """Configure root logger to write to both stdout and a daily log file."""
+    """
+    Configure root logger to write to stdout, a daily activity log, and a
+    daily error log. The error log exists so that when this runs headless
+    (as a service, with no console attached) nothing that would normally
+    show up on screen — tracebacks, unhandled exceptions from worker
+    threads — gets silently lost.
+    """
     fmt = logging.Formatter(
         fmt="%(asctime)s  %(levelname)-8s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -152,9 +198,29 @@ def setup_logging(log_dir: str) -> None:
     console.setFormatter(fmt)
     root.addHandler(console)
 
-    daily = DailyFileHandler(log_dir)
+    daily = DailyFileHandler(log_dir, "nac_accounting")
     daily.setFormatter(fmt)
     root.addHandler(daily)
+
+    errors = DailyFileHandler(log_dir, "errors")
+    errors.setLevel(logging.ERROR)
+    errors.setFormatter(fmt)
+    root.addHandler(errors)
+
+    def _log_uncaught_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logging.critical("Uncaught exception in main thread",
+                          exc_info=(exc_type, exc_value, exc_tb))
+
+    def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+        logging.error("Unhandled exception in thread %s",
+                       args.thread.name if args.thread else "?",
+                       exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _log_uncaught_exception
+    threading.excepthook = _log_thread_exception
 
 # ---------------------------------------------------------------------------
 # RADIUS packet builder
@@ -253,19 +319,21 @@ def build_accounting_request(event: dict) -> bytes:
     length     = 20 + len(attrs)   # 20 = fixed header size
 
     # Authenticator: MD5 over header (with zeroed auth field) + attrs + secret
-    # Encode secret to bytes if it was set as a plain string in the config
-    secret   = RADIUS_SECRET.encode() if isinstance(RADIUS_SECRET, str) else RADIUS_SECRET
     pre_auth = struct.pack(">BBH", code, identifier, length) + b"\x00" * 16 + attrs
-    authenticator = hashlib.md5(pre_auth + secret).digest()
+    authenticator = hashlib.md5(pre_auth + RADIUS_SECRET_BYTES).digest()
 
     header = struct.pack(">BBH16s", code, identifier, length, authenticator)
     return header + attrs
 
 
+# A single UDP socket is opened once and reused for every packet — avoids
+# a socket create/destroy syscall pair on every webhook event.
+_radius_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
 def send_radius(packet: bytes) -> None:
     """Send a RADIUS packet to the FortiGate via UDP."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.sendto(packet, (RADIUS_HOST, RADIUS_PORT))
+    _radius_socket.sendto(packet, (RADIUS_HOST, RADIUS_PORT))
 
 
 def log_event(event: dict) -> None:
@@ -307,6 +375,14 @@ class WebhookHandler(BaseHTTPRequestHandler):
     """Handles inbound HTTP POST requests from the Mist webhook service."""
 
     def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception:
+            logging.exception("Unhandled error processing webhook from %s",
+                               self.client_address[0])
+            self._respond(500, "Internal Server Error")
+
+    def _handle_post(self):
         # Validate optional shared secret
         if WEBHOOK_SECRET is not None:
             if self.headers.get("X-Mist-Secret", "") != WEBHOOK_SECRET:
@@ -369,18 +445,50 @@ class WebhookHandler(BaseHTTPRequestHandler):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class ForwarderServer(ThreadingHTTPServer):
+    """Handles each webhook POST on its own thread so a slow RADIUS send
+    (or a burst of events) doesn't stall other incoming requests."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        # Default socketserver behaviour prints the traceback to stderr,
+        # which is lost when running headless. Send it to the error log
+        # instead. The server keeps serving other requests either way.
+        logging.exception("Unhandled exception while handling request from %s",
+                           client_address)
+
+
 def main():
     setup_logging(LOG_DIR)
+    logging.info("Config file       : %s", CONFIG_PATH)
     logging.info("Webhook receiver  : %s:%d", LISTEN_HOST, LISTEN_PORT)
     logging.info("RADIUS Accounting : %s:%d", RADIUS_HOST, RADIUS_PORT)
     logging.info("Log directory     : %s", os.path.abspath(LOG_DIR))
 
-    server = HTTPServer((LISTEN_HOST, LISTEN_PORT), WebhookHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logging.info("Shutting down.")
-        server.server_close()
+    # If the server loop itself dies unexpectedly (as opposed to a single
+    # request failing, which handle_error already contains) log it and
+    # restart rather than letting the process exit, since this runs as an
+    # unattended service.
+    backoff = 1
+    while True:
+        server = None
+        try:
+            server = ForwarderServer((LISTEN_HOST, LISTEN_PORT), WebhookHandler)
+            logging.info("Server started.")
+            backoff = 1
+            server.serve_forever()
+            break  # serve_forever only returns after shutdown() is called
+        except KeyboardInterrupt:
+            logging.info("Shutting down.")
+            break
+        except Exception:
+            logging.exception("Server crashed unexpectedly — restarting in %ds", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+        finally:
+            if server is not None:
+                server.server_close()
 
 
 if __name__ == "__main__":
