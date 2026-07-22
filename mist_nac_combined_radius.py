@@ -129,6 +129,14 @@ SEND_FILTER_ID  = _cfg.getboolean("attributes", "send_filter_id", fallback=True)
 SEND_CLASS      = _cfg.getboolean("attributes", "send_class", fallback=True)
 SEND_VLAN_ATTRS = _cfg.getboolean("attributes", "send_vlan_attrs", fallback=True)
 
+# Some NAS/RADIUS-accounting-profile implementations refresh identity cleanly
+# on Interim-Update but handle Start/Stop transitions differently — if that's
+# what your FortiGate is doing, this sends every packet as Interim-Update
+# regardless of the underlying Mist event, while still including whatever
+# Stop-only attributes (Acct-Session-Time, Acct-Terminate-Cause) are present.
+# Off by default since this deviates from RFC 2866's documented semantics.
+FORCE_INTERIM_UPDATE = _cfg.getboolean("attributes", "force_interim_update", fallback=False)
+
 CORRELATION_TIMEOUT_SECONDS = _cfg.getfloat("correlation", "start_correlation_timeout_seconds", fallback=5.0)
 ENRICHMENT_CACHE_TTL_HOURS  = _cfg.getfloat("correlation", "enrichment_cache_ttl_hours", fallback=12.0)
 CLEANUP_INTERVAL_SECONDS    = _cfg.getfloat("correlation", "cleanup_interval_seconds", fallback=300.0)
@@ -427,9 +435,10 @@ def build_start_packet(accounting_event: dict, permit_event: dict) -> bytes:
     group_role  = (permit_event or {}).get("group_role", "")
     vlan_str    = (permit_event or {}).get("vlan", "")
     nas_port_type = NAS_PORT_TYPE_MAP.get(client_type, NAS_PORT_TYPE_DEFAULT)
+    acct_status = ACCT_STATUS_INTERIM if FORCE_INTERIM_UPDATE else ACCT_STATUS_START
 
     attrs = b""
-    attrs += _attr(ATTR_ACCT_STATUS_TYPE,   struct.pack(">I", ACCT_STATUS_START))
+    attrs += _attr(ATTR_ACCT_STATUS_TYPE,   struct.pack(">I", acct_status))
     attrs += _attr(ATTR_SERVICE_TYPE,       struct.pack(">I", SERVICE_TYPE_FRAMED))
     attrs += _attr(ATTR_USER_NAME,          user.encode())
     attrs += _attr(ATTR_NAS_IP_ADDRESS,     socket.inet_aton(nas_ip_str))
@@ -448,7 +457,7 @@ def build_update_stop_packet(event: dict, enrichment: dict) -> bytes:
     mist_nac_radius.py, with Filter-Id/Class/VLAN appended from cached
     enrichment if this session ever had a NAC_CLIENT_PERMIT."""
     event_type  = event.get("type", "")
-    acct_status = ACCOUNTING_EVENT_TYPE_MAP[event_type]
+    acct_status = ACCT_STATUS_INTERIM if FORCE_INTERIM_UPDATE else ACCOUNTING_EVENT_TYPE_MAP[event_type]
 
     user, mac, nas_ip_str, session_id, ssid = _session_identity(event)
     client_ip = event.get("client_ip")
@@ -868,6 +877,7 @@ def main():
     logging.info("Filter-Id (role)      : %s", "enabled" if SEND_FILTER_ID else "disabled")
     logging.info("Class (role)          : %s", "enabled" if SEND_CLASS else "disabled")
     logging.info("VLAN attributes       : %s", "enabled" if SEND_VLAN_ATTRS else "disabled")
+    logging.info("Force Interim-Update  : %s", "enabled" if FORCE_INTERIM_UPDATE else "disabled")
     logging.info("Correlation timeout   : %.1fs", CORRELATION_TIMEOUT_SECONDS)
     logging.info("Enrichment cache TTL  : %.1fh", ENRICHMENT_CACHE_TTL_HOURS)
 

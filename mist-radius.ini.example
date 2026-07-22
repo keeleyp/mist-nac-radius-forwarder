@@ -19,3 +19,13 @@ radius_secret = changeme
 [logging]
 ; Directory where daily log files are written (nac_accounting_YYYY-MM-DD.log)
 log_dir = ./logs
+
+[attributes]
+; Some NAS/RADIUS-accounting-profile implementations refresh identity cleanly
+; on Interim-Update but handle Start/Stop transitions differently. If that's
+; what your FortiGate is doing, set this to true to send every packet as
+; Interim-Update regardless of the underlying Mist event (Start-only/
+; Stop-only attributes like Acct-Session-Time/Acct-Terminate-Cause are still
+; included as normal). Deviates from RFC 2866's documented semantics, so it's
+; off by default.
+force_interim_update = false

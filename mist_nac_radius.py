@@ -93,6 +93,14 @@ LOG_DIR = _cfg.get("logging", "log_dir", fallback="./logs")
 # Optional Mist webhook secret (sent as X-Mist-Secret header). Empty/absent = disabled.
 WEBHOOK_SECRET = _cfg.get("server", "webhook_secret", fallback="") or None
 
+# Some NAS/RADIUS-accounting-profile implementations refresh identity cleanly
+# on Interim-Update but handle Start/Stop transitions differently — if that's
+# what your FortiGate is doing, this sends every packet as Interim-Update
+# regardless of the underlying Mist event, while still including whatever
+# Stop-only attributes (Acct-Session-Time, Acct-Terminate-Cause) are present.
+# Off by default since this deviates from RFC 2866's documented semantics.
+FORCE_INTERIM_UPDATE = _cfg.getboolean("attributes", "force_interim_update", fallback=False)
+
 # ---------------------------------------------------------------------------
 # RADIUS attribute type constants  (RFC 2865 / 2866)
 # ---------------------------------------------------------------------------
@@ -303,7 +311,7 @@ def build_accounting_request(event: dict) -> bytes:
         Raw bytes of a RADIUS Accounting-Request packet.
     """
     event_type  = event.get("type", "")
-    acct_status = EVENT_TYPE_MAP[event_type]   # KeyError intentional — validated before calling
+    acct_status = ACCT_STATUS_INTERIM if FORCE_INTERIM_UPDATE else EVENT_TYPE_MAP[event_type]   # KeyError intentional — validated before calling
 
     user       = event.get("username", "unknown")
     mac        = event.get("mac", "")
@@ -551,6 +559,7 @@ def main():
     logging.info("Webhook receiver  : %s:%d", LISTEN_HOST, LISTEN_PORT)
     logging.info("RADIUS Accounting : %s:%d", RADIUS_HOST, RADIUS_PORT)
     logging.info("Log directory     : %s", os.path.abspath(LOG_DIR))
+    logging.info("Force Interim-Update : %s", "enabled" if FORCE_INTERIM_UPDATE else "disabled")
 
     # If the server loop itself dies unexpectedly (as opposed to a single
     # request failing, which handle_error already contains) log it and

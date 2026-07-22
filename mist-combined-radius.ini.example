@@ -37,6 +37,15 @@ send_vlan_attrs = true
 ; matches the convention seen in known-working RADIUS accounting traffic on
 ; this network.
 
+; Some NAS/RADIUS-accounting-profile implementations refresh identity cleanly
+; on Interim-Update but handle Start/Stop transitions differently. If that's
+; what your FortiGate is doing, set this to true to send every packet
+; (including the initial Start and any Stop) as Interim-Update instead —
+; Stop-only attributes like Acct-Session-Time/Acct-Terminate-Cause are still
+; included as normal. Deviates from RFC 2866's documented semantics, so it's
+; off by default.
+force_interim_update = false
+
 [correlation]
 ; How long to wait for the matching nac-events PERMIT / nac-accounting START
 ; event on the same session_id before sending an initial Start packet with
