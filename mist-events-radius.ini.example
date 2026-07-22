@@ -1,0 +1,30 @@
+; Copy this file to mist-events-radius.ini and edit the values for your environment.
+; mist-events-radius.ini is gitignored so secrets never get committed.
+
+[server]
+listen_host = 0.0.0.0
+; Port forwarded through your firewall to this host
+listen_port = 8080
+; Mist webhook secret. Used to verify the X-Mist-Signature header
+; (hex HMAC-SHA1 of the raw request body). Leave blank to disable
+; verification — not recommended for anything reachable from the internet.
+webhook_secret =
+
+[radius]
+; FortiGate IP address
+radius_host = 172.16.0.12
+; RADIUS Accounting port (RFC 2866 default)
+radius_port = 1813
+; Shared secret — must match FortiGate RSSO config
+radius_secret = changeme
+
+[logging]
+; Directory where daily log files are written
+; (nac_events_YYYY-MM-DD.log, errors_YYYY-MM-DD.log)
+log_dir = ./logs
+
+[attributes]
+; Send the client's NAC role (group_role) as RADIUS Filter-Id
+send_filter_id = true
+; Send VLAN as RFC 2868 Tunnel-Type / Tunnel-Medium-Type / Tunnel-Private-Group-Id
+send_vlan_attrs = true
