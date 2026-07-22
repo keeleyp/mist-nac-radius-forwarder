@@ -113,6 +113,8 @@ ATTR_ACCT_INPUT_PACKETS   = 47
 ATTR_ACCT_OUTPUT_PACKETS  = 48
 ATTR_ACCT_TERMINATE_CAUSE = 49
 ATTR_NAS_PORT_TYPE        = 61
+ATTR_ACCT_INPUT_GIGAWORDS  = 52   # RFC 2869 — high 32 bits of Acct-Input-Octets
+ATTR_ACCT_OUTPUT_GIGAWORDS = 53   # RFC 2869 — high 32 bits of Acct-Output-Octets
 
 ACCT_STATUS_START         = 1
 ACCT_STATUS_STOP          = 2
@@ -232,6 +234,56 @@ def _attr(attr_type: int, value: bytes) -> bytes:
     return struct.pack("BB", attr_type, 2 + len(value)) + value
 
 
+def _coerce_uint(value):
+    """
+    Best-effort coercion of a Mist-supplied numeric field to a non-negative
+    Python int. Returns None for anything that isn't a whole, non-negative
+    number (wrong type, negative "unknown" sentinel, non-integral float).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+    return None
+
+
+def _uint32_attr(attr_type: int, value, field_name: str) -> bytes:
+    """
+    Encode a single-attribute unsigned-32 field, guarding against values
+    Mist can send that don't fit RADIUS's 32-bit range (e.g. a negative
+    "unknown" sentinel). Invalid values are logged and omitted rather than
+    aborting the whole packet.
+    """
+    coerced = _coerce_uint(value)
+    if coerced is None or coerced > 0xFFFFFFFF:
+        logging.warning("Ignoring out-of-range %s value %r", field_name, value)
+        return b""
+    return _attr(attr_type, struct.pack(">I", coerced))
+
+
+def _octets_attr(attr_low: int, attr_high: int, value, field_name: str) -> bytes:
+    """
+    Encode a byte counter as Acct-Input/Output-Octets, plus the matching
+    Gigawords attribute (RFC 2869 §5.1/5.2) when the value exceeds 32 bits
+    — Mist's raw counters aren't capped at 4GB, but a single RADIUS
+    attribute is. Negative/non-integer values are logged and omitted.
+    """
+    coerced = _coerce_uint(value)
+    if coerced is None:
+        logging.warning("Ignoring invalid %s value %r", field_name, value)
+        return b""
+    gigawords, remainder = divmod(coerced, 1 << 32)
+    attrs = _attr(attr_low, struct.pack(">I", remainder))
+    if gigawords:
+        if gigawords > 0xFFFFFFFF:
+            logging.warning("%s value %r exceeds Gigawords range — truncating", field_name, value)
+            gigawords &= 0xFFFFFFFF
+        attrs += _attr(attr_high, struct.pack(">I", gigawords))
+    return attrs
+
+
 def build_accounting_request(event: dict) -> bytes:
     """
     Build a complete RFC-2866 RADIUS Accounting-Request packet.
@@ -291,24 +343,31 @@ def build_accounting_request(event: dict) -> bytes:
             logging.warning("Invalid client_ip '%s' — omitting Framed-IP-Address", client_ip)
 
     # --- Traffic counters (UPDATE and STOP) ---
+    # Byte counters use Gigawords (RFC 2869) since Mist doesn't cap these at
+    # 4GB but a single RADIUS attribute can't hold more than that.
     rx_bytes = event.get("rx_bytes")
     tx_bytes = event.get("tx_bytes")
     rx_pkts  = event.get("rx_pkts")
     tx_pkts  = event.get("tx_pkts")
 
     if rx_bytes is not None:
-        attrs += _attr(ATTR_ACCT_INPUT_OCTETS,   struct.pack(">I", rx_bytes))
+        attrs += _octets_attr(ATTR_ACCT_INPUT_OCTETS, ATTR_ACCT_INPUT_GIGAWORDS, rx_bytes, "rx_bytes")
     if tx_bytes is not None:
-        attrs += _attr(ATTR_ACCT_OUTPUT_OCTETS,  struct.pack(">I", tx_bytes))
+        attrs += _octets_attr(ATTR_ACCT_OUTPUT_OCTETS, ATTR_ACCT_OUTPUT_GIGAWORDS, tx_bytes, "tx_bytes")
     if rx_pkts is not None:
-        attrs += _attr(ATTR_ACCT_INPUT_PACKETS,  struct.pack(">I", rx_pkts))
+        attrs += _uint32_attr(ATTR_ACCT_INPUT_PACKETS, rx_pkts, "rx_pkts")
     if tx_pkts is not None:
-        attrs += _attr(ATTR_ACCT_OUTPUT_PACKETS, struct.pack(">I", tx_pkts))
+        attrs += _uint32_attr(ATTR_ACCT_OUTPUT_PACKETS, tx_pkts, "tx_pkts")
 
     # --- Session duration and terminate cause (STOP only) ---
     duration_mins = event.get("session_duration_in_mins")
     if duration_mins is not None:
-        attrs += _attr(ATTR_ACCT_SESSION_TIME, struct.pack(">I", duration_mins * 60))
+        try:
+            duration_secs = round(float(duration_mins) * 60)
+        except (TypeError, ValueError):
+            logging.warning("Invalid session_duration_in_mins %r — omitting Acct-Session-Time", duration_mins)
+        else:
+            attrs += _uint32_attr(ATTR_ACCT_SESSION_TIME, duration_secs, "session_duration_in_mins")
 
     terminate_cause_str = event.get("terminate_cause")
     if terminate_cause_str:
