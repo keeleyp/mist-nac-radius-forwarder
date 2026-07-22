@@ -30,8 +30,19 @@ session_id instead:
     in memory and attached to that session's later
     NAC_ACCOUNTING_UPDATE/STOP packets too, since nac-events never
     fires again for the same session.
+  - If the permit arrives *after* the correlation timeout already sent
+    a role-less Start (the common case when nac-events consistently
+    lags nac-accounting), an out-of-band correction Interim-Update is
+    sent immediately with the newly-learned role/VLAN, rather than
+    waiting for the next naturally-occurring Update/Stop — which may
+    be minutes away, or may never come for a short session. Some
+    FortiGate RADIUS accounting/subscriber-profile configurations
+    depend on Class/Filter-Id to resolve identity at all, so a session
+    stuck without one for a long stretch can show up with a blank or
+    incorrect username in FortiGate, not just a missing role.
   - A session_id that has already had its initial Start sent won't be
-    sent a second one by a late/duplicate webhook delivery.
+    sent a second one by a late/duplicate webhook delivery, and won't
+    have more than one correction sent either.
 
 Usage:
   python3 mist_nac_combined_radius.py [-c /path/to/mist-combined-radius.ini]
@@ -256,9 +267,15 @@ def setup_logging(log_dir: str) -> None:
 # _enrichment: session_id -> {"group_role": str, "vlan": str, "cached_at": float}
 #              Learned from a NAC_CLIENT_PERMIT; applied to that session's later
 #              Update/Stop packets. Cleared on Stop, swept by TTL otherwise.
-# _started:    session_id -> float (time.monotonic() when the initial Start was sent)
+# _started:    session_id -> {"sent_at": float, "identity": dict, "corrected": bool}
 #              Prevents a duplicate/late webhook delivery from sending a second
-#              initial Start for the same session. Cleared on Stop, swept by TTL.
+#              initial Start for the same session. "identity" carries enough of
+#              the original Start's fields (user/mac/nas_ip/ssid) to build a
+#              standalone correction packet later without needing a fresh
+#              accounting event. "corrected" tracks whether a role/VLAN
+#              correction has already been sent for this session — see
+#              _handle_permit's late-arrival branch. Cleared on Stop, swept by
+#              TTL otherwise.
 
 _state_lock = threading.Lock()
 _pending    = {}
@@ -277,7 +294,7 @@ def _cleanup_sweep() -> None:
             stale_enrichment = [sid for sid, v in _enrichment.items() if now - v["cached_at"] > max_age]
             for sid in stale_enrichment:
                 del _enrichment[sid]
-            stale_started = [sid for sid, ts in _started.items() if now - ts > max_age]
+            stale_started = [sid for sid, v in _started.items() if now - v["sent_at"] > max_age]
             for sid in stale_started:
                 del _started[sid]
         if stale_enrichment or stale_started:
@@ -352,6 +369,15 @@ def _mac_fmt(mac: str) -> str:
         "-".join(mac[i:i+2].upper() for i in range(0, 12, 2))
         if len(mac) == 12 else mac
     )
+
+
+def _identity_dict(accounting_event, permit_event) -> dict:
+    """Session identity fields as sent in the initial Start packet, saved so
+    a later out-of-band correction (see _send_correction_update) can be built
+    without needing a fresh accounting event to hang it off of."""
+    primary = accounting_event or permit_event
+    user, mac, nas_ip_str, session_id, ssid = _session_identity(primary)
+    return {"user": user, "mac": mac, "nas_ip": nas_ip_str, "session_id": session_id, "ssid": ssid}
 
 
 def _role_vlan_attrs(group_role: str, vlan_str: str) -> bytes:
@@ -507,6 +533,38 @@ def _send_start_and_log(session_id: str, accounting_event, permit_event, reason:
         logging.error("Failed to send Start RADIUS for session %s: %s", session_id, exc)
 
 
+def _send_correction_update(session_id: str, identity: dict, enrichment: dict) -> None:
+    """
+    Send an out-of-band Interim-Update carrying role/VLAN, for a session whose
+    initial Start already went out without them (correlation timeout fired
+    before the permit arrived). Without this, FortiGate wouldn't see the role
+    at all until the next naturally-occurring Update/Stop from Mist — which
+    may be minutes away or may never come for a short session. FortiGate's
+    RADIUS accounting profile matching depends on this attribute being
+    present to resolve identity at all (see the "profile not found" / missing
+    username symptom this fixes), so this is sent as soon as it's known
+    rather than waiting.
+    """
+    synthetic_event = {
+        "type": "NAC_ACCOUNTING_UPDATE",
+        "username": identity.get("user"),
+        "mac": identity.get("mac"),
+        "nas_ip": identity.get("nas_ip"),
+        "session_id": session_id,
+        "ssid": identity.get("ssid"),
+    }
+    try:
+        packet = build_update_stop_packet(synthetic_event, enrichment)
+        send_radius(packet)
+        logging.info(
+            "RADIUS → %s:%d  type=Correction-Update(late permit)  session=%s  user=%s  group_role=%s  (%d bytes)",
+            RADIUS_HOST, RADIUS_PORT, session_id, identity.get("user", "?"),
+            enrichment.get("group_role", "?"), len(packet),
+        )
+    except Exception as exc:
+        logging.error("Failed to send correction RADIUS for session %s: %s", session_id, exc)
+
+
 def _fallback_send(session_id: str) -> None:
     """Timer callback: correlation window expired with only one half present."""
     with _state_lock:
@@ -515,7 +573,15 @@ def _fallback_send(session_id: str) -> None:
             return  # the other half arrived and handled this already
         if session_id in _started:
             return  # shouldn't happen, but never double-send
-        _started[session_id] = time.monotonic()
+        # If the permit was the half that showed up, role/VLAN are already
+        # in the Start about to be sent — no correction needed later. If it
+        # was the accounting half only, role is still unknown.
+        already_has_role = entry["permit"] is not None
+        _started[session_id] = {
+            "sent_at": time.monotonic(),
+            "identity": _identity_dict(entry["start"], entry["permit"]),
+            "corrected": already_has_role,
+        }
     _send_start_and_log(session_id, entry["start"], entry["permit"], "timeout")
 
 
@@ -529,31 +595,46 @@ def _handle_permit(event: dict) -> None:
         _send_start_and_log(f"mist-{random.randint(0, 0xFFFFFFFF):08x}", None, event, "no-session-id")
         return
 
+    correction = None       # (identity, enrichment) to send outside the lock, if any
+    accounting_event = permit_event = None   # merged Start to send outside the lock, if any
+
     with _state_lock:
         _enrichment[session_id] = {"group_role": group_role, "vlan": vlan, "cached_at": time.monotonic()}
 
         if session_id in _started:
-            # Late permit for an already-started session — enrichment is now
-            # cached for future Update/Stop packets, nothing more to send.
-            return
-
-        entry = _pending.setdefault(session_id, {"permit": None, "start": None, "timer": None})
-        entry["permit"] = event
-
-        if entry["start"] is not None:
-            if entry["timer"]:
-                entry["timer"].cancel()
-            del _pending[session_id]
-            _started[session_id] = time.monotonic()
-            accounting_event, permit_event = entry["start"], entry["permit"]
+            # Late permit for an already-started session. If that Start went
+            # out without role/VLAN (accounting-only fallback), send a
+            # one-time correction now rather than waiting for the next
+            # naturally-occurring Update/Stop, which may be minutes away or
+            # may never come for a short session.
+            started_entry = _started[session_id]
+            if not started_entry["corrected"]:
+                started_entry["corrected"] = True
+                correction = (started_entry["identity"], dict(_enrichment[session_id]))
         else:
-            if entry["timer"] is None:
-                entry["timer"] = threading.Timer(CORRELATION_TIMEOUT_SECONDS, _fallback_send, args=[session_id])
-                entry["timer"].daemon = True
-                entry["timer"].start()
-            return
+            entry = _pending.setdefault(session_id, {"permit": None, "start": None, "timer": None})
+            entry["permit"] = event
 
-    _send_start_and_log(session_id, accounting_event, permit_event, "correlated")
+            if entry["start"] is not None:
+                if entry["timer"]:
+                    entry["timer"].cancel()
+                del _pending[session_id]
+                _started[session_id] = {
+                    "sent_at": time.monotonic(),
+                    "identity": _identity_dict(entry["start"], entry["permit"]),
+                    "corrected": True,   # role/VLAN already in this Start
+                }
+                accounting_event, permit_event = entry["start"], entry["permit"]
+            else:
+                if entry["timer"] is None:
+                    entry["timer"] = threading.Timer(CORRELATION_TIMEOUT_SECONDS, _fallback_send, args=[session_id])
+                    entry["timer"].daemon = True
+                    entry["timer"].start()
+
+    if correction:
+        _send_correction_update(session_id, correction[0], correction[1])
+    elif accounting_event is not None or permit_event is not None:
+        _send_start_and_log(session_id, accounting_event, permit_event, "correlated")
 
 
 def _handle_deny(event: dict) -> None:
@@ -590,7 +671,11 @@ def _handle_accounting_start(event: dict) -> None:
             if entry["timer"]:
                 entry["timer"].cancel()
             del _pending[session_id]
-            _started[session_id] = time.monotonic()
+            _started[session_id] = {
+                "sent_at": time.monotonic(),
+                "identity": _identity_dict(entry["start"], entry["permit"]),
+                "corrected": True,   # role/VLAN already in this Start
+            }
             accounting_event, permit_event = entry["start"], entry["permit"]
         else:
             if entry["timer"] is None:
