@@ -100,6 +100,7 @@ WEBHOOK_SECRET = _cfg.get("server", "webhook_secret", fallback="") or None
 ATTR_USER_NAME            =  1
 ATTR_NAS_IP_ADDRESS       =  4
 ATTR_FRAMED_IP_ADDRESS    =  8
+ATTR_FILTER_ID            = 11   # Role / user group, for FortiGate policy matching
 ATTR_CALLING_STATION_ID   = 31   # Client MAC
 ATTR_CALLED_STATION_ID    = 30   # SSID
 ATTR_NAS_IDENTIFIER       = 32
@@ -236,7 +237,7 @@ def build_accounting_request(event: dict) -> bytes:
     Build a complete RFC-2866 RADIUS Accounting-Request packet.
 
     Attributes included vary by event type:
-      START  — User-Name, NAS-IP, MAC, Session-Id, SSID, NAS-Port-Type
+      START  — User-Name, NAS-IP, MAC, Session-Id, SSID, Filter-Id, NAS-Port-Type
       UPDATE — as above + Framed-IP-Address, byte/packet counters
       STOP   — as above + Session-Time, Terminate-Cause
 
@@ -258,6 +259,7 @@ def build_accounting_request(event: dict) -> bytes:
     client_ip  = event.get("client_ip")         # present on UPDATE and STOP
     session_id = event.get("session_id", f"mist-{random.randint(0, 0xFFFFFFFF):08x}")
     ssid       = event.get("ssid", "")
+    usergroup  = event.get("usergroup", "")     # NAC role — mapped to Filter-Id
 
     # Calling-Station-Id format: "2A-5B-B8-14-DA-3D"
     mac_fmt = (
@@ -277,6 +279,9 @@ def build_accounting_request(event: dict) -> bytes:
 
     if ssid:
         attrs += _attr(ATTR_CALLED_STATION_ID, ssid.encode())
+
+    if usergroup:
+        attrs += _attr(ATTR_FILTER_ID, usergroup.encode())
 
     # --- Framed-IP-Address (present on UPDATE and STOP) ---
     if client_ip:
@@ -344,6 +349,7 @@ def log_event(event: dict) -> None:
     client_ip  = event.get("client_ip", "-")
     session_id = event.get("session_id", "?")
     ssid       = event.get("ssid", "?")
+    usergroup  = event.get("usergroup", "?")
 
     # Build a compact one-line summary; include stats when present
     parts = [
@@ -353,6 +359,7 @@ def log_event(event: dict) -> None:
         f"ip={client_ip}",
         f"session={session_id}",
         f"ssid={ssid}",
+        f"usergroup={usergroup}",
     ]
 
     if event.get("rx_bytes") is not None:
@@ -421,14 +428,15 @@ class WebhookHandler(BaseHTTPRequestHandler):
             try:
                 packet = build_accounting_request(event)
                 send_radius(packet)
-                logging.info("RADIUS → %s:%d  type=%s  session=%s  (%d bytes)",
+                logging.info("RADIUS → %s:%d  type=%s  session=%s  usergroup=%s  (%d bytes)",
                              RADIUS_HOST, RADIUS_PORT,
                              event_type, event.get("session_id", "?"),
+                             event.get("usergroup", "?"),
                              len(packet))
                 forwarded += 1
             except Exception as exc:
-                logging.error("Failed to send RADIUS for session %s: %s",
-                              event.get("session_id", "?"), exc)
+                logging.error("Failed to send RADIUS for session %s (usergroup=%s): %s",
+                              event.get("session_id", "?"), event.get("usergroup", "?"), exc)
 
         self._respond(200, "OK")
 

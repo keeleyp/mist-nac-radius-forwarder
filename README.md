@@ -1,6 +1,6 @@
 # mist-nac-radius-forwarder
 
-Forwards Juniper Mist NAC accounting webhooks as RFC-2866 RADIUS Accounting packets to a FortiGate, so FortiGate RADIUS SSO (RSSO) can track authenticated wireless identities.
+Forwards Juniper Mist NAC accounting webhooks as RFC-2866 RADIUS Accounting packets to a FortiGate, so FortiGate RADIUS SSO (RSSO) can track authenticated wireless identities. The client's Mist NAC role (`usergroup`) is forwarded too, as the standard RADIUS `Filter-Id` attribute.
 
 Full installation, configuration, and deployment guide: [Mist_NAC_RADIUS_Guide.docx](Mist_NAC_RADIUS_Guide.docx).
 
@@ -69,6 +69,6 @@ See the [full guide](Mist_NAC_RADIUS_Guide.docx) for FortiGate RSSO setup, the M
 
 ## Logging and reliability
 
-- `logs/nac_accounting_YYYY-MM-DD.log` — daily activity log (every event received and forwarded).
-- `logs/errors_YYYY-MM-DD.log` — ERROR-level and above only, including full tracebacks from unhandled exceptions. Check this first when troubleshooting a headless deployment.
+- `logs/nac_accounting_YYYY-MM-DD.log` — daily activity log (every event received and forwarded), including each session's `usergroup`.
+- `logs/errors_YYYY-MM-DD.log` — ERROR-level and above only, including full tracebacks from unhandled exceptions and the `usergroup` of any session whose RADIUS send failed. Check this first when troubleshooting a headless deployment.
 - The HTTP listener is threaded and the server auto-restarts in-process with backoff if it crashes unexpectedly, independent of systemd's `Restart=on-failure`.
