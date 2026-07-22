@@ -383,10 +383,19 @@ class WebhookHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             self._handle_post()
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected before we finished writing a response —
+            # a normal network condition, not an application bug. Don't try
+            # to write a 500 here too; that write would fail the same way.
+            logging.info("Client %s disconnected before response could be sent",
+                         self.client_address[0])
         except Exception:
             logging.exception("Unhandled error processing webhook from %s",
                                self.client_address[0])
-            self._respond(500, "Internal Server Error")
+            try:
+                self._respond(500, "Internal Server Error")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _handle_post(self):
         content_length = int(self.headers.get("Content-Length", 0))
@@ -465,6 +474,15 @@ class ForwarderServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):
+        # A client disconnecting before we finish writing a response (e.g.
+        # Mist's webhook sender closing the connection early) surfaces here
+        # as BrokenPipeError/ConnectionResetError. That's a normal network
+        # condition, not an application bug — log it quietly instead of as
+        # an ERROR with a full traceback, so errors_*.log stays meaningful.
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (BrokenPipeError, ConnectionResetError)):
+            logging.info("Client %s disconnected before response could be sent", client_address)
+            return
         logging.exception("Unhandled exception while handling request from %s",
                            client_address)
 
