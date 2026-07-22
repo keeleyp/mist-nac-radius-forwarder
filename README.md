@@ -31,7 +31,7 @@ $EDITOR mist-combined-radius.ini   # set radius_host and radius_secret at minimu
 python3 mist_nac_combined_radius.py
 ```
 
-Point Mist at this single URL/port for **both** the `nac-accounting` and `nac-events` topics — one webhook with both selected, or two webhooks pointing at the same URL. It correlates `NAC_CLIENT_PERMIT` (role/VLAN) with `NAC_ACCOUNTING_START` (session/IP) by `session_id`, sending one merged Start packet — waiting up to `start_correlation_timeout_seconds` (default 5s) for both halves before sending with whatever's available. Learned role/VLAN is cached in memory and attached to that session's later Update/Stop packets too. Guide sections 22–31.
+Point Mist at this single URL/port for **both** the `nac-accounting` and `nac-events` topics — one webhook with both selected, or two webhooks pointing at the same URL. It correlates `NAC_CLIENT_PERMIT` (role/VLAN) with `NAC_ACCOUNTING_START` (session/IP) by `session_id`, sending one merged Start packet — waiting up to `start_correlation_timeout_seconds` (default 5s) for both halves before sending with whatever's available. If the permit arrives *after* that timeout, an immediate correction packet carries the role/VLAN in rather than waiting for the next natural Update/Stop (v4.1+ — see below). Learned role/VLAN is cached in memory and attached to that session's later Update/Stop packets too. Guide sections 22–31.
 
 Config resolution order: `-c/--config` flag → `MIST_COMBINED_RADIUS_CONFIG` env var → `mist-combined-radius.ini` next to the script.
 
@@ -120,6 +120,7 @@ All three services share the same model:
 - A daily `errors_YYYY-MM-DD.log` — ERROR-level and above only, including full tracebacks from unhandled exceptions. Check this first when troubleshooting a headless deployment.
 - A threaded HTTP listener and an in-process auto-restart with backoff if the server loop crashes unexpectedly, independent of systemd's `Restart=on-failure`.
 - Byte counters (`rx_bytes`/`tx_bytes`) are encoded with RFC 2869 Gigawords when they exceed 32 bits, instead of failing the whole packet — a real production issue on long-lived, high-traffic sessions, fixed in v3.1.
+- A client disconnecting before a response is fully written (`BrokenPipeError`/`ConnectionResetError`) logs one quiet line instead of two ERROR-level tracebacks — fixed in v4.1.
 
 ## Known limitations of the nac-events forwarder
 
@@ -132,6 +133,11 @@ Read before deploying — see guide section 12.4. (The combined forwarder doesn'
 
 - **Merge**: a `NAC_CLIENT_PERMIT` and `NAC_ACCOUNTING_START` sharing a `session_id` are merged into one Start packet.
 - **Timeout fallback**: if only one arrives within `start_correlation_timeout_seconds` (default 5s), it's sent alone rather than waiting indefinitely — important for clients that get denied (no accounting Start will ever follow) or a webhook that's lost.
+- **Late-permit correction (v4.1+)**: if the permit arrives after the timeout already sent a role-less Start, an immediate out-of-band Interim-Update carries the role/VLAN in, instead of waiting for the next natural Update/Stop — which may be minutes away, or may never come for a short session. Look for `Correction-Update(late permit)` in `nac_combined_*.log`.
 - **Enrichment persists**: once learned, role/VLAN are cached in memory (`enrichment_cache_ttl_hours`, default 12h) and attached to that session's later Update/Stop packets.
-- **Dedup**: a session that already had its initial Start sent won't get a second one from a late or duplicate webhook delivery.
-- **In-memory only**: a restart clears any mid-correlation sessions and cached enrichment — see guide §29.
+- **Dedup**: a session that already had its initial Start sent won't get a second one from a late or duplicate webhook delivery, and won't get more than one correction either.
+- **In-memory only**: a restart clears any mid-correlation sessions, cached enrichment, and correction state — see guide §29.
+
+### Diagnosing FortiGate-side symptoms
+
+On one real deployment, most sessions were falling back to `(accounting-only, timeout)` — the permit consistently arrived after the correlation window. Before the v4.1 correction, that meant no `Class`/`Filter-Id` reached FortiGate for those sessions until (if ever) a natural Update/Stop arrived. FortiGate's own event log showed this as more than a missing role: `RADIUS accounting profile not found: Missing profile name`, with the displayed identity falling back to something like the SSID name instead of the username. If you see that same FortiGate log message, it's very likely the same root cause, not a separate username bug — check for a `Correction-Update(late permit)` line for the affected session in `nac_combined_*.log`, and re-check the FortiGate log/view afterward. Guide section 22.4.
