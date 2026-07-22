@@ -6,8 +6,8 @@ Receives nac-events webhooks from Juniper Mist and forwards each
 NAC_CLIENT_PERMIT decision as an RFC-2866 RADIUS Accounting-Request
 (Start) packet to a FortiGate firewall, so its RADIUS SSO (RSSO)
 feature can establish user identity — including the client's NAC
-role, via the Filter-Id attribute, and VLAN, via the RFC-2868 Tunnel
-attributes.
+role, via the Filter-Id and Class attributes, and VLAN, via the
+RFC-2868 Tunnel attributes.
 
 This is a separate integration from the original nac-accounting-based
 forwarder (mist_nac_radius.py). nac-events fires once per
@@ -117,6 +117,7 @@ WEBHOOK_SECRET = _cfg.get("server", "webhook_secret", fallback="") or None
 # Which optional attribute groups to include, derived from fields that are
 # only present in nac-events (not the older nac-accounting stream).
 SEND_FILTER_ID   = _cfg.getboolean("attributes", "send_filter_id", fallback=True)
+SEND_CLASS       = _cfg.getboolean("attributes", "send_class", fallback=True)
 SEND_VLAN_ATTRS  = _cfg.getboolean("attributes", "send_vlan_attrs", fallback=True)
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,11 @@ SEND_VLAN_ATTRS  = _cfg.getboolean("attributes", "send_vlan_attrs", fallback=Tru
 
 ATTR_USER_NAME               =  1
 ATTR_NAS_IP_ADDRESS          =  4
+ATTR_SERVICE_TYPE            =  6
 ATTR_FILTER_ID               = 11   # NAC role, from group_role
+ATTR_CLASS                   = 25   # NAC role, from group_role — sent alongside Filter-Id;
+                                     # a known-working non-Mist NAS on this network conveys
+                                     # role via Class rather than Filter-Id
 ATTR_CALLED_STATION_ID       = 30   # SSID
 ATTR_CALLING_STATION_ID      = 31   # Client MAC
 ATTR_ACCT_STATUS_TYPE        = 40
@@ -135,7 +140,8 @@ ATTR_TUNNEL_TYPE             = 64   # RFC 2868 — tagged
 ATTR_TUNNEL_MEDIUM_TYPE      = 65   # RFC 2868 — tagged
 ATTR_TUNNEL_PRIVATE_GROUP_ID = 81   # RFC 2868 — tagged, VLAN ID as string
 
-ACCT_STATUS_START = 1   # The only status this service ever sends — see module docstring
+ACCT_STATUS_START  = 1   # The only status this service ever sends — see module docstring
+SERVICE_TYPE_FRAMED = 2  # RFC 2865 §5.6
 
 NAS_PORT_TYPE_MAP = {
     "wireless": 19,   # IEEE 802.11
@@ -275,6 +281,7 @@ def build_accounting_request(event: dict) -> bytes:
 
     attrs = b""
     attrs += _attr(ATTR_ACCT_STATUS_TYPE,   struct.pack(">I", ACCT_STATUS_START))
+    attrs += _attr(ATTR_SERVICE_TYPE,       struct.pack(">I", SERVICE_TYPE_FRAMED))
     attrs += _attr(ATTR_USER_NAME,          user.encode())
     attrs += _attr(ATTR_NAS_IP_ADDRESS,     socket.inet_aton(nas_ip_str))
     attrs += _attr(ATTR_CALLING_STATION_ID, mac_fmt.encode())
@@ -284,12 +291,18 @@ def build_accounting_request(event: dict) -> bytes:
     if ssid:
         attrs += _attr(ATTR_CALLED_STATION_ID, ssid.encode())
 
-    # --- NAC role (Filter-Id) ---
+    # --- NAC role (Filter-Id and Class) ---
     # group_role is the field Mist itself uses to compute the Filter-Id it
     # returns to the NAS (visible in resp_attrs) — idp_role is a separate,
     # possibly multi-valued IdP group list and is not a reliable substitute.
-    if SEND_FILTER_ID and group_role:
-        attrs += _attr(ATTR_FILTER_ID, group_role.encode())
+    # Class is sent alongside Filter-Id because a confirmed-working non-Mist
+    # NAS on this network conveys role via Class (echoing the value from its
+    # own RADIUS Access-Accept, per RFC 2865 §5.25) rather than Filter-Id.
+    if group_role:
+        if SEND_FILTER_ID:
+            attrs += _attr(ATTR_FILTER_ID, group_role.encode())
+        if SEND_CLASS:
+            attrs += _attr(ATTR_CLASS, group_role.encode())
 
     # --- VLAN (RFC 2868 tunnel attributes) ---
     if SEND_VLAN_ATTRS and vlan_str:
@@ -463,6 +476,7 @@ def main():
     logging.info("RADIUS Accounting : %s:%d", RADIUS_HOST, RADIUS_PORT)
     logging.info("Log directory     : %s", os.path.abspath(LOG_DIR))
     logging.info("Filter-Id (role)  : %s", "enabled" if SEND_FILTER_ID else "disabled")
+    logging.info("Class (role)      : %s", "enabled" if SEND_CLASS else "disabled")
     logging.info("VLAN attributes   : %s", "enabled" if SEND_VLAN_ATTRS else "disabled")
 
     backoff = 1

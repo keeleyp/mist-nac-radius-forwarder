@@ -1,0 +1,54 @@
+; Copy this file to mist-combined-radius.ini and edit the values for your environment.
+; mist-combined-radius.ini is gitignored so secrets never get committed.
+
+[server]
+listen_host = 0.0.0.0
+; Port forwarded through your firewall to this host.
+; Point Mist webhooks for BOTH nac-accounting and nac-events at this same port.
+listen_port = 8080
+; Mist webhook secret. Used to verify the X-Mist-Signature header
+; (hex HMAC-SHA1 of the raw request body). Leave blank to disable
+; verification — not recommended for anything reachable from the internet.
+webhook_secret =
+
+[radius]
+; FortiGate IP address
+radius_host = 172.16.0.12
+; RADIUS Accounting port (RFC 2866 default)
+radius_port = 1813
+; Shared secret — must match FortiGate RSSO config
+radius_secret = changeme
+
+[logging]
+; Directory where daily log files are written
+; (nac_combined_YYYY-MM-DD.log, errors_YYYY-MM-DD.log)
+log_dir = ./logs
+
+[attributes]
+; Send the client's NAC role (group_role, from nac-events) as RADIUS Filter-Id
+send_filter_id = true
+; Also send the client's NAC role (group_role) as RADIUS Class. Sent
+; alongside Filter-Id since some NAS/RSSO setups key role off Class instead.
+send_class = true
+; Send VLAN (from nac-events) as RFC 2868 Tunnel-Type / Tunnel-Medium-Type / Tunnel-Private-Group-Id
+send_vlan_attrs = true
+
+; Service-Type = Framed (2) is always sent on every packet — not configurable,
+; matches the convention seen in known-working RADIUS accounting traffic on
+; this network.
+
+[correlation]
+; How long to wait for the matching nac-events PERMIT / nac-accounting START
+; event on the same session_id before sending an initial Start packet with
+; whatever's available. Keep this short — in practice the two events usually
+; arrive within milliseconds of each other; this is a safety net, not the
+; normal-case latency.
+start_correlation_timeout_seconds = 5
+
+; How long a session's learned role/VLAN (from a nac-events PERMIT) is kept
+; in memory to enrich that session's later Update/Stop packets, for sessions
+; that never send a Stop (client roamed away, went dark, etc.).
+enrichment_cache_ttl_hours = 12
+
+; How often the background sweep checks for expired enrichment/session state.
+cleanup_interval_seconds = 300

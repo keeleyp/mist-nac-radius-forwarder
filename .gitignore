@@ -1,5 +1,6 @@
 mist-radius.ini
 mist-events-radius.ini
+mist-combined-radius.ini
 logs/
 __pycache__/
 *.pyc

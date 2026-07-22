@@ -26,5 +26,11 @@ log_dir = ./logs
 [attributes]
 ; Send the client's NAC role (group_role) as RADIUS Filter-Id
 send_filter_id = true
+; Also send the client's NAC role (group_role) as RADIUS Class. Sent
+; alongside Filter-Id since some NAS/RSSO setups key role off Class instead.
+send_class = true
 ; Send VLAN as RFC 2868 Tunnel-Type / Tunnel-Medium-Type / Tunnel-Private-Group-Id
 send_vlan_attrs = true
+
+; Service-Type = Framed (2) is always sent — not configurable, matches the
+; convention seen in known-working RADIUS accounting traffic on this network.
